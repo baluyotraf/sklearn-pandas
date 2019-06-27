@@ -1,10 +1,12 @@
 import sys
 import contextlib
+from itertools import chain
 
 import pandas as pd
 import numpy as np
 from scipy import sparse
 from sklearn.base import BaseEstimator, TransformerMixin
+from joblib import Parallel, delayed
 
 from .cross_validation import DataWrapper
 from .pipeline import make_transformer_pipeline, _call_fit, TransformerPipeline
@@ -69,7 +71,7 @@ class DataFrameMapper(BaseEstimator, TransformerMixin):
     """
 
     def __init__(self, features, default=False, sparse=False, df_out=False,
-                 input_df=False):
+                 input_df=False, njobs=1):
         """
         Params:
 
@@ -109,6 +111,7 @@ class DataFrameMapper(BaseEstimator, TransformerMixin):
         self.sparse = sparse
         self.df_out = df_out
         self.input_df = input_df
+        self.njobs = njobs
         self.transformed_names_ = []
 
         if (df_out and (sparse or default)):
@@ -210,13 +213,17 @@ class DataFrameMapper(BaseEstimator, TransformerMixin):
         """
         self._build()
 
-        for columns, transformers, options in self.built_features:
-            input_df = options.get('input_df', self.input_df)
+        @delayed
+        def fit_all(col, tr, op):
+            input_df = op.get('input_df', self.input_df)
 
-            if transformers is not None:
-                with add_column_names_to_exception(columns):
-                    Xt = self._get_col_subset(X, columns, input_df)
-                    _call_fit(transformers.fit, Xt, y)
+            if tr is not None:
+                with add_column_names_to_exception(col):
+                    Xt = self._get_col_subset(X, col, input_df)
+                    _call_fit(tr.fit, Xt, y)
+            return col, tr, op
+
+        self.built_features = Parallel(self.njobs)(fit_all(*f) for f in self.built_features)
 
         # handle features not explicitly selected
         if self.built_default:  # not False and not None
@@ -287,28 +294,31 @@ class DataFrameMapper(BaseEstimator, TransformerMixin):
         if do_fit:
             self._build()
 
-        extracted = []
-        self.transformed_names_ = []
-        for columns, transformers, options in self.built_features:
-            input_df = options.get('input_df', self.input_df)
+        @delayed
+        def transform_all(col, tr, op):
+            input_df = op.get('input_df', self.input_df)
 
             # columns could be a string or list of
             # strings; we don't care because pandas
             # will handle either.
-            Xt = self._get_col_subset(X, columns, input_df)
-            if transformers is not None:
-                with add_column_names_to_exception(columns):
-                    if do_fit and hasattr(transformers, 'fit_transform'):
-                        Xt = _call_fit(transformers.fit_transform, Xt, y)
+            Xt = self._get_col_subset(X, col, input_df)
+            if tr is not None:
+                with add_column_names_to_exception(col):
+                    if do_fit and hasattr(tr, 'fit_transform'):
+                        Xt = _call_fit(tr.fit_transform, Xt, y)
                     else:
                         if do_fit:
-                            _call_fit(transformers.fit, Xt, y)
-                        Xt = transformers.transform(Xt)
-            extracted.append(_handle_feature(Xt))
+                            _call_fit(tr.fit, Xt, y)
+                        Xt = tr.transform(Xt)
+            extracted = _handle_feature(Xt)
 
-            alias = options.get('alias')
-            self.transformed_names_ += self.get_names(
-                columns, transformers, Xt, alias)
+            alias = op.get('alias')
+            transformed_names = self.get_names(col, tr, Xt, alias)
+            return extracted, transformed_names
+
+        transformed_all = Parallel(self.njobs)(transform_all(*f) for f in self.built_features)
+        extracted, transformed_names = map(list, zip(*transformed_all))
+        self.transformed_names_ = list(chain.from_iterable(transformed_names))
 
         # handle features not explicitly selected
         if self.built_default is not False:
